@@ -110,6 +110,9 @@ let browserStarting = null;
 const MAX_CONCURRENT_CHECKS = 2;
 let runningChecks = 0;
 const checkQueue = [];
+let emptyMetaFailures = 0;
+let browserRecycleRequested = false;
+const MAX_EMPTY_META_FAILURES = 2;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -254,14 +257,36 @@ async function checkOnce(username) {
     const data = await page.evaluate(() => {
       const ogDesc = document.querySelector('meta[property="og:description"]');
       const ogImg  = document.querySelector('meta[property="og:image"]');
+      const title = document.title || '';
+      const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
       return {
         desc: ogDesc?.getAttribute('content') || '',
-        img:  ogImg?.getAttribute('content') || ''
+        img:  ogImg?.getAttribute('content') || '',
+        title,
+        bodyText: bodyText.slice(0, 2000)
       };
     });
 
     const raw = data.desc || '';
     console.log(`[check] ${username} og:description:`, raw.substring(0, 100));
+
+    // Instagram can temporarily return an incomplete page with empty OG metadata.
+    // Do not interpret an empty metadata response as a ban.
+    const pageText = `${data.title || ''} ${data.bodyText || ''}`.toLowerCase();
+    const clearlyUnavailable = /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
+
+    if (!raw.trim() && !clearlyUnavailable) {
+      emptyMetaFailures++;
+      console.warn(`[check] ${username}: empty Instagram metadata (${emptyMetaFailures}/${MAX_EMPTY_META_FAILURES}); treating as temporary failure.`);
+      if (emptyMetaFailures >= MAX_EMPTY_META_FAILURES) {
+        browserRecycleRequested = true;
+        emptyMetaFailures = 0;
+        console.warn('[browser] Repeated empty metadata detected; Chromium will be recycled after active checks finish.');
+      }
+      return null;
+    }
+
+    if (raw.trim()) emptyMetaFailures = 0;
 
     const numPat  = '([\\d,.]+[KMBkmb]?)';
     const fMatch  = raw.match(new RegExp(numPat + '\\s*Followers?', 'i'));
@@ -309,7 +334,7 @@ async function checkOnce(username) {
       }
     }
 
-    const banned = !followers && !following;
+    const banned = clearlyUnavailable || (!followers && !following && !!raw.trim());
     return { banned, followers, following, posts, profilePic, bio: '', isVerified: false };
 
   } catch (err) {
@@ -319,6 +344,21 @@ async function checkOnce(username) {
     // Close ONLY the page, never the shared Chromium instance.
     if (page) await page.close().catch(() => {});
     if (slotAcquired) releaseCheckSlot();
+
+    // Recycle only after all active checks have released their slots.
+    if (browserRecycleRequested && runningChecks === 0 && !browserStarting) {
+      browserRecycleRequested = false;
+      const oldBrowser = sharedBrowser;
+      sharedBrowser = null;
+      if (oldBrowser) {
+        try {
+          await oldBrowser.close();
+          console.log('[browser] Shared Chromium recycled after repeated empty Instagram responses.');
+        } catch (e) {
+          console.warn('[browser] Chromium recycle failed:', e.message);
+        }
+      }
+    }
   }
 }
 
