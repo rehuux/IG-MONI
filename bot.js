@@ -34,6 +34,7 @@ const EM = {
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
+const TOKEN            = process.env.DISCORD_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 
 // Two owners — hardcoded + env
@@ -169,6 +170,10 @@ async function getBrowser() {
     const browser = await puppeteer.launch({
       headless: true,
       executablePath: chromePath,
+      // Instagram can keep a renderer/CDP call busy for longer than
+      // Puppeteer's default protocol timeout. Give Runtime.callFunctionOn
+      // enough time to finish instead of killing healthy checks too early.
+      protocolTimeout: 120000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -230,6 +235,11 @@ async function checkOnce(username) {
     browser = await getBrowser();
     page = await browser.newPage();
 
+    // Keep page operations bounded while allowing the CDP protocol itself
+    // more time (configured above) for slow Instagram renderer responses.
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(60000);
+
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 800 });
 
@@ -245,8 +255,8 @@ async function checkOnce(username) {
       const ogDesc = document.querySelector('meta[property="og:description"]');
       const ogImg  = document.querySelector('meta[property="og:image"]');
       return {
-        desc: ogDesc ? ogDesc.getAttribute('content') : '',
-        img:  ogImg  ? ogImg.getAttribute('content')  : ''
+        desc: ogDesc?.getAttribute('content') || '',
+        img:  ogImg?.getAttribute('content') || ''
       };
     });
 
@@ -1666,35 +1676,18 @@ async function startBot() {
   console.log('──────────────────────────────────────────');
   console.log('[DISCORD] Starting login...');
   console.log('[DISCORD] TOKEN exists:', !!token);
-  console.log('[DISCORD] TOKEN length:', token ? token.length : 0);
 
   if (!token) {
-    throw new Error(
-      'DISCORD_TOKEN is missing from Railway environment variables.'
-    );
+    throw new Error('DISCORD_TOKEN is missing from environment variables.');
   }
 
-  // Remove accidental whitespace/newlines/quotes.
   token = token.trim();
-
-  if (
-    (token.startsWith('"') && token.endsWith('"')) ||
-    (token.startsWith("'") && token.endsWith("'"))
-  ) {
+  if ((token.startsWith('\"') && token.endsWith('\"')) ||
+      (token.startsWith("'") && token.endsWith("'"))) {
     token = token.slice(1, -1).trim();
   }
 
-  console.log('[DISCORD] TOKEN after cleanup length:', token.length);
-  console.log(
-    '[DISCORD] TOKEN preview:',
-    token.length > 10
-      ? token.slice(0, 5) + '...' + token.slice(-5)
-      : 'INVALID'
-  );
-
-  if (token.length < 20) {
-    throw new Error('DISCORD_TOKEN looks invalid/too short.');
-  }
+  console.log('[DISCORD] TOKEN length:', token.length);
 
   try {
     await client.login(token);
@@ -1702,18 +1695,13 @@ async function startBot() {
     console.log('[DISCORD] Bot:', client.user?.tag || 'unknown');
     return client;
   } catch (err) {
-    console.error('──────────────────────────────────────────');
     console.error('❌ DISCORD LOGIN FAILED');
-    console.error('Error name:', err?.name);
     console.error('Error code:', err?.code);
     console.error('Error message:', err?.message);
-    console.error('Token exists:', !!token);
-    console.error('Token length:', token.length);
-    console.error('──────────────────────────────────────────');
     throw err;
   }
 }
 
-module.exports = {
-  start: startBot
-};
+module.exports = { start: startBot };
+
+
