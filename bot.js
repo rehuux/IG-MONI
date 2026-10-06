@@ -495,8 +495,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
   try {
     const { createCanvas, loadImage, GlobalFonts } = require('@napi-rs/canvas');
 
-    const W = 800, PAD = 28;
-    const AVATAR_SIZE = 100;
+    const W = 900, PAD = 30;
+    const AVATAR_SIZE = 120;
     const BIO_MAX_W   = 500;
 
     // Measure bio lines
@@ -519,8 +519,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
       if (line) bioLines.push(line);
     }
 
-    const H = PAD + AVATAR_SIZE + PAD + (bioLines.length > 0 ? bioLines.length * 18 + 10 : 0);
-    const canvas = createCanvas(W, Math.max(H, 170));
+    const H = PAD + AVATAR_SIZE + PAD + (bioLines.length > 0 ? bioLines.length * 20 + 12 : 0);
+    const canvas = createCanvas(W, Math.max(H, 230));
     const ctx    = canvas.getContext('2d');
 
     // Background
@@ -593,11 +593,11 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
 
     // Right side start
     const rx = avatarX + AVATAR_SIZE + 20;
-    let   ry = PAD + 6;
+    let   ry = PAD + 8;
 
     // Username
     ctx.fillStyle = '#ffffff';
-    ctx.font      = '500 18px sans-serif';
+    ctx.font      = '600 22px sans-serif';
     ctx.fillText(username, rx, ry + 14);
 
     // Inline verified badge next to username
@@ -628,8 +628,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
     ctx.roundRect(btnX, btnY, 80, 28, 8);
     ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.font      = 'bold 13px sans-serif';
-    ctx.fillText('Follow', btnX + 16, btnY + 18);
+    ctx.font      = 'bold 14px sans-serif';
+    ctx.fillText('Follow', btnX + 17, btnY + 19);
 
     // More button
     ctx.fillStyle = '#2e2e2e';
@@ -637,37 +637,37 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
     ctx.roundRect(btnX + 88, btnY, 36, 28, 8);
     ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.font      = 'bold 15px sans-serif';
-    ctx.fillText('···', btnX + 96, btnY + 18);
+    ctx.font      = 'bold 16px sans-serif';
+    ctx.fillText('···', btnX + 97, btnY + 19);
 
     ry += 42;
 
-    // Stats — number bold on top, label small below (no overlap)
+    // Stats — large, high-contrast numbers so they remain readable in Discord
     const stats = [
       { num: fmtNum(posts),     label: 'posts' },
       { num: fmtNum(followers), label: 'followers' },
       { num: fmtNum(following), label: 'following' }
     ];
-    const statColW = 110;
+    const statColW = 150;
     let sx = rx;
     for (const s of stats) {
-      // Bold number
       ctx.fillStyle = '#ffffff';
-      ctx.font      = 'bold 16px sans-serif';
+      ctx.font      = 'bold 25px sans-serif';
+      ctx.textBaseline = 'alphabetic';
       ctx.fillText(s.num, sx, ry);
-      // Small grey label below
-      ctx.fillStyle = '#aaaaaa';
-      ctx.font      = '12px sans-serif';
-      ctx.fillText(s.label, sx, ry + 16);
+
+      ctx.fillStyle = '#d0d0d0';
+      ctx.font      = '600 15px sans-serif';
+      ctx.fillText(s.label, sx, ry + 21);
       sx += statColW;
     }
 
-    ry += 34;
+    ry += 44;
 
     // Bio
     if (bioLines.length > 0) {
       ctx.fillStyle = '#e0e0e0';
-      ctx.font      = '13px sans-serif';
+      ctx.font      = '14px sans-serif';
       for (const line of bioLines) {
         ctx.fillText(line, rx, ry);
         ry += 18;
