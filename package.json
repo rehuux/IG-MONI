@@ -1,0 +1,37 @@
+{
+  "name": "ig-monitor-bot-v2",
+  "version": "2.0.0",
+  "description": "Instagram ban/unban monitor",
+  "main": "index.js",
+  "bin": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "npx puppeteer browsers install chrome",
+    "reset": "rm -f watchlist.json",
+    "build-exe": "node build-exe.js"
+  },
+  "pkg": {
+    "targets": ["node18-win-x64"],
+    "outputPath": "dist",
+    "assets": [
+      "channels.json",
+      "emojis.json",
+      "watchlist.json"
+    ],
+    "scripts": [
+      "commands/**/*.js",
+      "db.js",
+      "bot.js"
+    ]
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "0.1.100",
+    "axios": "1.7.9",
+    "discord.js": "^14.26.3",
+    "dotenv": "^16.3.1",
+    "mongoose": "8.4.0",
+    "puppeteer": "24.15.0",
+    "sqlite3": "^6.0.1"
+  },
+  "author": "BrahmjotCodez(1ttp)"
+}
