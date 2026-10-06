@@ -34,7 +34,6 @@ const EM = {
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const TOKEN            = process.env.DISCORD_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 
 // Two owners — hardcoded + env
@@ -1661,6 +1660,60 @@ async function shutdown(signal) {
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-module.exports = { start: () => client.login(TOKEN) };
+async function startBot() {
+  let token = process.env.DISCORD_TOKEN;
 
+  console.log('──────────────────────────────────────────');
+  console.log('[DISCORD] Starting login...');
+  console.log('[DISCORD] TOKEN exists:', !!token);
+  console.log('[DISCORD] TOKEN length:', token ? token.length : 0);
 
+  if (!token) {
+    throw new Error(
+      'DISCORD_TOKEN is missing from Railway environment variables.'
+    );
+  }
+
+  // Remove accidental whitespace/newlines/quotes.
+  token = token.trim();
+
+  if (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1).trim();
+  }
+
+  console.log('[DISCORD] TOKEN after cleanup length:', token.length);
+  console.log(
+    '[DISCORD] TOKEN preview:',
+    token.length > 10
+      ? token.slice(0, 5) + '...' + token.slice(-5)
+      : 'INVALID'
+  );
+
+  if (token.length < 20) {
+    throw new Error('DISCORD_TOKEN looks invalid/too short.');
+  }
+
+  try {
+    await client.login(token);
+    console.log('✅ Discord login successful');
+    console.log('[DISCORD] Bot:', client.user?.tag || 'unknown');
+    return client;
+  } catch (err) {
+    console.error('──────────────────────────────────────────');
+    console.error('❌ DISCORD LOGIN FAILED');
+    console.error('Error name:', err?.name);
+    console.error('Error code:', err?.code);
+    console.error('Error message:', err?.message);
+    console.error('Token exists:', !!token);
+    console.error('Token length:', token.length);
+    console.error('──────────────────────────────────────────');
+    throw err;
+  }
+}
+
+module.exports = {
+  start: startBot
+};
