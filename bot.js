@@ -107,7 +107,7 @@ function parseNum(str) {
 // One Chromium process is shared between checks. Each account still gets a
 // completely fresh page, so cookies/page state are isolated while Chromium
 // process creation stays bounded to ONE instance.
-const MAX_CONCURRENT_CHECKS = 2;
+const MAX_CONCURRENT_CHECKS = 1;
 const CHECK_HARD_TIMEOUT = Math.max(30000, parseInt(process.env.PUPPETEER_HARD_TIMEOUT || '55000', 10));
 let runningChecks = 0;
 const checkQueue = [];
@@ -208,7 +208,7 @@ async function launchBrowser() {
   return puppeteer.launch({
     headless: true,
     executablePath: chromePath,
-    protocolTimeout: 30000,
+    protocolTimeout: 60000,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -267,7 +267,11 @@ async function recycleSharedBrowser(reason) {
 async function runCheckWithBrowser(username, browser) {
   let page = null;
   try {
-    page = await browser.newPage();
+    // Reuse Chromium's existing page instead of creating a new CDP target for
+    // every Instagram check. Target.createTarget was timing out on Railway.
+    const pages = await browser.pages();
+    page = pages[0] || await browser.newPage();
+    try { await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (_) {}
     page.setDefaultTimeout(20000);
     page.setDefaultNavigationTimeout(35000);
 
@@ -357,7 +361,8 @@ async function runCheckWithBrowser(username, browser) {
     const banned = clearlyUnavailable || (!followers && !following && !!raw.trim());
     return { banned, followers, following, posts, profilePic, bio: '', isVerified: false };
   } finally {
-    await safeClosePage(page);
+    // Keep the page alive for reuse. Closing it here forces another
+    // Target.createTarget on the next check.
   }
 }
 
@@ -400,8 +405,10 @@ async function checkOnce(username) {
 
     // EAGAIN means the OS refused a new Chromium process. With the shared
     // browser design this should be rare; recycle the stale instance once.
-    if (/EAGAIN|Failed to launch the browser process/i.test(err.message || '')) {
-      await recycleSharedBrowser(`${username} browser launch failed (EAGAIN)`);
+    if (/EAGAIN|Failed to launch the browser process|Target\.createTarget timed out|Target\.createTarget/i.test(err.message || '')) {
+      await recycleSharedBrowser(`${username} Chromium target/browser failure`);
+      // Give Railway's process table a moment to settle before another launch.
+      await sleep(3000);
     }
     return null;
   } finally {
@@ -417,8 +424,8 @@ async function check(username, retries = 2) {
     const result = await checkOnce(username);
     if (result !== null) return result;
     if (i < retries - 1) {
-      console.log(`[check] ${username} retry ${i + 2}/${retries} in 2s...`);
-      await sleep(2000);
+      console.log(`[check] ${username} retry ${i + 2}/${retries} in 5s...`);
+      await sleep(5000);
     }
   }
   console.warn(`[check] ${username}: all attempts failed; returning UNKNOWN/null.`);
