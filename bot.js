@@ -104,14 +104,19 @@ function parseNum(str) {
 }
 
 // ─── Puppeteer checker + hard watchdog + concurrency limiter ──────────────────
-// Each account check gets its own Chromium process. This keeps one stuck
-// Instagram renderer/session from poisoning another account's check.
+// One Chromium process is shared between checks. Each account still gets a
+// completely fresh page, so cookies/page state are isolated while Chromium
+// process creation stays bounded to ONE instance.
 const MAX_CONCURRENT_CHECKS = 2;
 const CHECK_HARD_TIMEOUT = Math.max(30000, parseInt(process.env.PUPPETEER_HARD_TIMEOUT || '55000', 10));
 let runningChecks = 0;
 const checkQueue = [];
 let emptyMetaFailures = 0;
 const MAX_EMPTY_META_FAILURES = 2;
+
+let sharedBrowser = null;
+let browserLaunchPromise = null;
+let browserRecyclePromise = null;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -123,7 +128,6 @@ function getChromePath() {
   if (!chromePath && typeof process.pkg !== 'undefined') {
     const exeDir = path.dirname(process.execPath);
     const cacheChromeDir = path.join(exeDir, '.cache', 'puppeteer', 'chrome');
-
     try {
       if (fs.existsSync(cacheChromeDir)) {
         const versions = fs.readdirSync(cacheChromeDir).sort().reverse();
@@ -153,7 +157,6 @@ function getChromePath() {
       }
     }
   }
-
   return chromePath;
 }
 
@@ -162,10 +165,7 @@ function acquireCheckSlot() {
     runningChecks++;
     return Promise.resolve();
   }
-
-  return new Promise(resolve => {
-    checkQueue.push(resolve);
-  }).then(() => {
+  return new Promise(resolve => checkQueue.push(resolve)).then(() => {
     runningChecks++;
   });
 }
@@ -179,43 +179,31 @@ function releaseCheckSlot() {
 async function safeClosePage(page) {
   if (!page) return;
   try {
-    await Promise.race([
-      page.close(),
-      sleep(1500)
-    ]);
+    await Promise.race([page.close(), sleep(1500)]);
   } catch (_) {}
 }
 
-async function forceKillBrowser(browser, reason) {
+async function killBrowserProcess(browser) {
   if (!browser) return;
-
-  console.warn(`[browser] FORCED RECOVERY: ${reason}`);
-
-  // Best effort graceful close first, but NEVER wait indefinitely.
-  try {
-    await Promise.race([
-      browser.close(),
-      sleep(1500)
-    ]);
-  } catch (_) {}
-
-  // If Puppeteer/CDP is still stuck, terminate Chromium itself.
   try {
     const proc = typeof browser.process === 'function' ? browser.process() : null;
-    if (proc && !proc.killed) {
-      proc.kill('SIGKILL');
-      console.warn('[browser] Chromium process killed after forced timeout.');
-    }
-  } catch (e) {
-    console.warn('[browser] Process kill failed:', e.message);
-  }
+    if (proc && !proc.killed) proc.kill('SIGKILL');
+  } catch (_) {}
+}
+
+async function closeBrowserInstance(browser, reason = '') {
+  if (!browser) return;
+  if (reason) console.warn(`[browser] Recycling Chromium: ${reason}`);
+  try {
+    await Promise.race([browser.close(), sleep(1500)]);
+  } catch (_) {}
+  await killBrowserProcess(browser);
 }
 
 async function launchBrowser() {
   const puppeteer = require('puppeteer');
   const chromePath = getChromePath();
-
-  console.log('[browser] Launching fresh Chromium for check...');
+  console.log('[browser] Launching shared Chromium...');
 
   return puppeteer.launch({
     headless: true,
@@ -228,9 +216,52 @@ async function launchBrowser() {
       '--disable-gpu',
       '--disable-web-security',
       '--disable-features=IsolateOrigins,site-per-process',
-      '--window-size=1280,800'
+      '--window-size=1280,800',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding'
     ]
   });
+}
+
+async function getSharedBrowser() {
+  if (sharedBrowser) {
+    try {
+      if (sharedBrowser.connected) return sharedBrowser;
+    } catch (_) {}
+    sharedBrowser = null;
+  }
+
+  // Only ONE launch can be in progress. This prevents simultaneous Chromium
+  // spawns from hitting Railway's process limit and causing EAGAIN.
+  if (!browserLaunchPromise) {
+    browserLaunchPromise = (async () => {
+      try {
+        const browser = await launchBrowser();
+        sharedBrowser = browser;
+        browser.on('disconnected', () => {
+          if (sharedBrowser === browser) sharedBrowser = null;
+          console.warn('[browser] Chromium disconnected. A fresh instance will be launched when needed.');
+        });
+        return browser;
+      } finally {
+        browserLaunchPromise = null;
+      }
+    })();
+  }
+  return browserLaunchPromise;
+}
+
+async function recycleSharedBrowser(reason) {
+  if (browserRecyclePromise) return browserRecyclePromise;
+  browserRecyclePromise = (async () => {
+    const browser = sharedBrowser;
+    sharedBrowser = null;
+    if (browser) await closeBrowserInstance(browser, reason);
+  })().finally(() => {
+    browserRecyclePromise = null;
+  });
+  return browserRecyclePromise;
 }
 
 async function runCheckWithBrowser(username, browser) {
@@ -257,7 +288,7 @@ async function runCheckWithBrowser(username, browser) {
       const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
       return {
         desc: ogDesc?.getAttribute('content') || '',
-        img:  ogImg?.getAttribute('content') || '',
+        img: ogImg?.getAttribute('content') || '',
         title,
         bodyText: bodyText.slice(0, 2000)
       };
@@ -269,8 +300,6 @@ async function runCheckWithBrowser(username, browser) {
     const pageText = `${data.title || ''} ${data.bodyText || ''}`.toLowerCase();
     const clearlyUnavailable = /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
 
-    // Empty OG metadata is NOT a ban. It is treated as a temporary failure so
-    // an active account cannot be falsely reported as banned.
     if (!raw.trim() && !clearlyUnavailable) {
       emptyMetaFailures++;
       console.warn(`[check] ${username}: empty Instagram metadata (${emptyMetaFailures}/${MAX_EMPTY_META_FAILURES}); temporary failure.`);
@@ -283,14 +312,14 @@ async function runCheckWithBrowser(username, browser) {
 
     if (raw.trim()) emptyMetaFailures = 0;
 
-    const numPat  = '([\\d,.]+[KMBkmb]?)';
-    const fMatch  = raw.match(new RegExp(numPat + '\\s*Followers?', 'i'));
+    const numPat = '([\\d,.]+[KMBkmb]?)';
+    const fMatch = raw.match(new RegExp(numPat + '\\s*Followers?', 'i'));
     const foMatch = raw.match(new RegExp(numPat + '\\s*Following', 'i'));
-    const pMatch  = raw.match(new RegExp(numPat + '\\s*Posts?', 'i'));
+    const pMatch = raw.match(new RegExp(numPat + '\\s*Posts?', 'i'));
 
-    const followers = fMatch  ? parseNum(fMatch[1])  : null;
+    const followers = fMatch ? parseNum(fMatch[1]) : null;
     const following = foMatch ? parseNum(foMatch[1]) : null;
-    const posts     = pMatch  ? parseNum(pMatch[1])  : null;
+    const posts = pMatch ? parseNum(pMatch[1]) : null;
 
     console.log(`[check] ${username} parsed: followers=${followers}, following=${following}`);
 
@@ -316,7 +345,6 @@ async function runCheckWithBrowser(username, browser) {
             xhr.send();
           });
         }, data.img);
-
         if (b64) {
           profilePic = Buffer.from(b64, 'base64');
           console.log(`[check] ${username} profile pic fetched via XHR (${profilePic.length} bytes)`);
@@ -334,32 +362,28 @@ async function runCheckWithBrowser(username, browser) {
 }
 
 async function checkOnce(username) {
-  let browser = null;
   let slotAcquired = false;
   let timedOut = false;
+  let browser = null;
 
   try {
     await acquireCheckSlot();
     slotAcquired = true;
     console.log(`[check] ${username} starting (${runningChecks}/${MAX_CONCURRENT_CHECKS} slots used)`);
 
-    browser = await launchBrowser();
+    browser = await getSharedBrowser();
 
-    // Promise.race alone does not cancel Puppeteer's underlying CDP call.
-    // Therefore the timeout also kills Chromium, which forcibly releases the
-    // stuck Runtime.callFunctionOn/navigation operation.
     let operation;
     let timer;
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(async () => {
         timedOut = true;
-        await forceKillBrowser(browser, `${username} exceeded ${CHECK_HARD_TIMEOUT}ms hard timeout`);
+        await recycleSharedBrowser(`${username} exceeded ${CHECK_HARD_TIMEOUT}ms hard timeout`);
         reject(new Error('PUPPETEER_HARD_TIMEOUT'));
       }, CHECK_HARD_TIMEOUT);
     });
 
     operation = runCheckWithBrowser(username, browser);
-    // Prevent a late rejection from the killed browser becoming unhandled.
     operation.catch(() => {});
 
     try {
@@ -372,17 +396,15 @@ async function checkOnce(username) {
     }
   } catch (err) {
     console.error(`[check] Puppeteer error for ${username}:`, err.message);
-    if (timedOut) console.warn(`[check] ${username}: hard watchdog recovered the stuck Chromium check.`);
+    if (timedOut) console.warn(`[check] ${username}: hard watchdog recycled the shared Chromium.`);
+
+    // EAGAIN means the OS refused a new Chromium process. With the shared
+    // browser design this should be rare; recycle the stale instance once.
+    if (/EAGAIN|Failed to launch the browser process/i.test(err.message || '')) {
+      await recycleSharedBrowser(`${username} browser launch failed (EAGAIN)`);
+    }
     return null;
   } finally {
-    // If this check failed, make a final best-effort cleanup. Never let cleanup
-    // block slot release indefinitely.
-    if (browser && !timedOut) {
-      try {
-        await Promise.race([browser.close(), sleep(1500)]);
-      } catch (_) {}
-    }
-
     if (slotAcquired) {
       releaseCheckSlot();
       console.log(`[check] ${username} slot released (${runningChecks}/${MAX_CONCURRENT_CHECKS} slots used)`);
@@ -390,8 +412,6 @@ async function checkOnce(username) {
   }
 }
 
-// Retry wrapper. A timeout/recycled browser always gets a completely fresh
-// Chromium process on the next attempt.
 async function check(username, retries = 2) {
   for (let i = 0; i < retries; i++) {
     const result = await checkOnce(username);
@@ -406,8 +426,9 @@ async function check(username, retries = 2) {
 }
 
 async function closeSharedBrowser() {
-  // Kept for shutdown compatibility. Checks now use per-check Chromium.
-  while (runningChecks > 0) await sleep(100);
+  const browser = sharedBrowser;
+  sharedBrowser = null;
+  if (browser) await closeBrowserInstance(browser, 'shutdown');
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
