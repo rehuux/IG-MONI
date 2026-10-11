@@ -278,7 +278,7 @@ async function runCheckWithBrowser(username, browser) {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 800 });
 
-    await page.goto(`https://www.instagram.com/${username}/`, {
+    const navigationResponse = await page.goto(`https://www.instagram.com/${username}/`, {
       waitUntil: 'domcontentloaded',
       timeout: 35000
     });
@@ -290,23 +290,37 @@ async function runCheckWithBrowser(username, browser) {
       const ogImg  = document.querySelector('meta[property="og:image"]');
       const title = document.title || '';
       const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      const url = location.href;
+      const htmlLength = document.documentElement?.outerHTML?.length || 0;
+      const lower = `${url} ${title} ${bodyText}`.toLowerCase();
       return {
         desc: ogDesc?.getAttribute('content') || '',
         img: ogImg?.getAttribute('content') || '',
         title,
-        bodyText: bodyText.slice(0, 2000)
+        url,
+        htmlLength,
+        bodyText: bodyText.slice(0, 2000),
+        signals: {
+          login: /\/accounts\/login|log in to instagram|login • instagram/.test(lower),
+          challenge: /challenge|checkpoint|confirm it.s you|security code|verify your identity/.test(lower),
+          rateLimit: /try again later|we restrict certain activity|please wait a few minutes|rate limit/.test(lower),
+          unavailable: /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(lower)
+        }
       };
     });
 
     const raw = data.desc || '';
+    const responseStatus = navigationResponse ? navigationResponse.status() : 'no-main-response';
+    console.log(`[check] ${username} navigation: status=${responseStatus} url=${data.url} title=${JSON.stringify(data.title)} html=${data.htmlLength}`);
+    console.log(`[check] ${username} page signals: ${JSON.stringify(data.signals)}`);
     console.log(`[check] ${username} og:description:`, raw.substring(0, 100));
 
     const pageText = `${data.title || ''} ${data.bodyText || ''}`.toLowerCase();
-    const clearlyUnavailable = /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
+    const clearlyUnavailable = data.signals?.unavailable || /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
 
     if (!raw.trim() && !clearlyUnavailable) {
       emptyMetaFailures++;
-      console.warn(`[check] ${username}: empty Instagram metadata (${emptyMetaFailures}/${MAX_EMPTY_META_FAILURES}); temporary failure.`);
+      console.warn(`[check] ${username}: empty Instagram metadata (${emptyMetaFailures}/${MAX_EMPTY_META_FAILURES}); temporary failure. status=${responseStatus} url=${data.url} signals=${JSON.stringify(data.signals)}`);
       if (emptyMetaFailures >= MAX_EMPTY_META_FAILURES) {
         emptyMetaFailures = 0;
         throw new Error('EMPTY_IG_METADATA_RECYCLE');
