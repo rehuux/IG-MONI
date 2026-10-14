@@ -709,15 +709,16 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
       { num: fmtNum(followers), label: 'followers' },
       { num: fmtNum(following), label: 'following' }
     ];
-    const statColW = 110;
+    const statColW = 150;
     let sx = rx;
     for (const s of stats) {
+      // Keep the original card layout, but make stats readable at Discord mobile scale.
       ctx.fillStyle = '#ffffff';
-      ctx.font      = 'bold 16px sans-serif';
+      ctx.font      = 'bold 24px sans-serif';
       ctx.fillText(s.num, sx, ry);
       ctx.fillStyle = '#aaaaaa';
-      ctx.font      = '12px sans-serif';
-      ctx.fillText(s.label, sx, ry + 16);
+      ctx.font      = '14px sans-serif';
+      ctx.fillText(s.label, sx, ry + 19);
       sx += statColW;
     }
 
