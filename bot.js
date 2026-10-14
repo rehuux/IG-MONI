@@ -709,18 +709,25 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
       { num: fmtNum(followers), label: 'followers' },
       { num: fmtNum(following), label: 'following' }
     ];
-    const statColW = 150;
-    let sx = rx;
-    for (const s of stats) {
+    // Keep all three stats inside the card and align each number/label.
+    // The old fixed 150px step made the columns look uneven in Discord's scaled preview.
+    const statsStartX = rx;
+    const statsRightPadding = PAD;
+    const statsAvailableW = W - statsStartX - statsRightPadding;
+    const statColW = statsAvailableW / stats.length;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    for (let i = 0; i < stats.length; i++) {
+      const s = stats[i];
+      const sx = statsStartX + i * statColW;
       ctx.fillStyle = '#ffffff';
-      ctx.font      = 'bold 25px sans-serif';
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillText(s.num, sx, ry);
+      ctx.font = 'bold 25px sans-serif';
+      ctx.letterSpacing = '0px';
+      ctx.fillText(s.num, sx, ry, statColW - 12);
 
       ctx.fillStyle = '#d0d0d0';
-      ctx.font      = '600 15px sans-serif';
-      ctx.fillText(s.label, sx, ry + 21);
-      sx += statColW;
+      ctx.font = '600 15px sans-serif';
+      ctx.fillText(s.label, sx, ry + 21, statColW - 12);
     }
 
     ry += 44;
