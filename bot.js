@@ -703,7 +703,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
 
     ry += 42;
 
-    // Stats — preserve the original layout: compact, evenly spaced columns below the buttons.
+    // Stats — use large, high-contrast values and labels so Discord mobile
+    // scaling does not make the numbers disappear.
     const stats = [
       { num: fmtNum(posts),     label: 'posts' },
       { num: fmtNum(followers), label: 'followers' },
@@ -712,16 +713,16 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
     const statColW = 150;
     let sx = rx;
     for (const s of stats) {
-      // Keep the original card layout, but make stats readable at Discord mobile scale.
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
       ctx.fillStyle = '#ffffff';
-      ctx.font      = 'bold 24px sans-serif';
-      ctx.fillText(s.num, sx, ry);
-      ctx.fillStyle = '#aaaaaa';
-      ctx.font      = '14px sans-serif';
-      ctx.fillText(s.label, sx, ry + 19);
+      ctx.font      = 'bold 32px sans-serif';
+      ctx.fillText(String(s.num ?? '—'), sx, ry);
+      ctx.fillStyle = '#d0d0d0';
+      ctx.font      = 'bold 20px sans-serif';
+      ctx.fillText(s.label, sx, ry + 27);
       sx += statColW;
     }
-
     ry += 34;
 
     // Bio
