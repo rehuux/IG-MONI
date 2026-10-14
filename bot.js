@@ -113,6 +113,9 @@ let runningChecks = 0;
 const checkQueue = [];
 let emptyMetaFailures = 0;
 const MAX_EMPTY_META_FAILURES = 2;
+// Instagram HTTP 429 cooldown: avoid immediate retries and repeated watch traffic.
+const IG_429_COOLDOWN_MS = Math.max(5 * 60 * 1000, parseInt(process.env.IG_429_COOLDOWN_MS || '900000', 10));
+let igRateLimitedUntil = 0;
 
 let sharedBrowser = null;
 let browserLaunchPromise = null;
@@ -315,6 +318,13 @@ async function runCheckWithBrowser(username, browser) {
     console.log(`[check] ${username} page signals: ${JSON.stringify(data.signals)}`);
     console.log(`[check] ${username} og:description:`, raw.substring(0, 100));
 
+    // HTTP 429 is authoritative even when Instagram's error page has no text.
+    if (Number(responseStatus) === 429) {
+      igRateLimitedUntil = Date.now() + IG_429_COOLDOWN_MS;
+      console.warn(`[check] ${username}: Instagram returned HTTP 429. Pausing all profile checks for ${Math.ceil(IG_429_COOLDOWN_MS / 60000)} minutes; account status remains UNKNOWN.`);
+      return null;
+    }
+
     const pageText = `${data.title || ''} ${data.bodyText || ''}`.toLowerCase();
     const clearlyUnavailable = data.signals?.unavailable || /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
 
@@ -381,6 +391,11 @@ async function runCheckWithBrowser(username, browser) {
 }
 
 async function checkOnce(username) {
+  if (Date.now() < igRateLimitedUntil) {
+    const secondsLeft = Math.ceil((igRateLimitedUntil - Date.now()) / 1000);
+    console.warn(`[check] ${username}: Instagram 429 cooldown active; skipping request (${secondsLeft}s left).`);
+    return null;
+  }
   let slotAcquired = false;
   let timedOut = false;
   let browser = null;
@@ -437,6 +452,10 @@ async function check(username, retries = 2) {
   for (let i = 0; i < retries; i++) {
     const result = await checkOnce(username);
     if (result !== null) return result;
+    if (Date.now() < igRateLimitedUntil) {
+      console.warn(`[check] ${username}: stopping retries because Instagram 429 cooldown is active; returning UNKNOWN/null.`);
+      return null;
+    }
     if (i < retries - 1) {
       console.log(`[check] ${username} retry ${i + 2}/${retries} in 5s...`);
       await sleep(5000);
