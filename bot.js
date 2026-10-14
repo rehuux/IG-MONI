@@ -703,24 +703,26 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
 
     ry += 42;
 
-    // Stats — use large, high-contrast values and labels so Discord mobile
-    // scaling does not make the numbers disappear.
+    // Stats: bright white numbers AND labels, positioned like the original card.
     const stats = [
       { num: fmtNum(posts),     label: 'posts' },
       { num: fmtNum(followers), label: 'followers' },
       { num: fmtNum(following), label: 'following' }
     ];
-    const statColW = 150;
+    const statColW = 142;
     let sx = rx;
     for (const s of stats) {
+      ctx.save();
+      ctx.globalAlpha = 1;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
       ctx.fillStyle = '#ffffff';
-      ctx.font      = 'bold 32px sans-serif';
+      ctx.font = 'bold 28px Arial, sans-serif';
       ctx.fillText(String(s.num ?? '—'), sx, ry);
-      ctx.fillStyle = '#d0d0d0';
-      ctx.font      = 'bold 20px sans-serif';
-      ctx.fillText(s.label, sx, ry + 27);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 16px Arial, sans-serif';
+      ctx.fillText(s.label, sx, ry + 22);
+      ctx.restore();
       sx += statColW;
     }
     ry += 34;
