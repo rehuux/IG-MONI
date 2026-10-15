@@ -120,6 +120,8 @@ let igRateLimitedUntil = 0;
 let sharedBrowser = null;
 let browserLaunchPromise = null;
 let browserRecyclePromise = null;
+let browserRotationInProgress = false;
+const CHROMIUM_ROTATION_MS = 6 * 60 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -164,7 +166,7 @@ function getChromePath() {
 }
 
 function acquireCheckSlot() {
-  if (runningChecks < MAX_CONCURRENT_CHECKS) {
+  if (!browserRotationInProgress && runningChecks < MAX_CONCURRENT_CHECKS) {
     runningChecks++;
     return Promise.resolve();
   }
@@ -175,7 +177,7 @@ function acquireCheckSlot() {
 
 function releaseCheckSlot() {
   runningChecks = Math.max(0, runningChecks - 1);
-  const next = checkQueue.shift();
+  const next = browserRotationInProgress ? null : checkQueue.shift();
   if (next) next();
 }
 
@@ -266,6 +268,38 @@ async function recycleSharedBrowser(reason) {
   });
   return browserRecyclePromise;
 }
+
+
+async function rotateSharedChromium(reason = 'scheduled 6-hour rotation') {
+  if (browserRotationInProgress) {
+    console.log('[browser] Rotation already in progress; skipping duplicate trigger.');
+    return;
+  }
+  browserRotationInProgress = true;
+  console.log(`[browser] Scheduled rotation requested; waiting for ${runningChecks} active check(s) to finish.`);
+  try {
+    // Do not close Chromium while a profile check is using its page.
+    while (runningChecks > 0) await sleep(1000);
+    await recycleSharedBrowser(reason);
+    console.log('[browser] Chromium rotation complete; a fresh instance will launch on the next check.');
+  } catch (err) {
+    console.error('[browser] Scheduled Chromium rotation failed:', err?.message || err);
+  } finally {
+    browserRotationInProgress = false;
+    // Resume queued checks only after the old browser has been closed.
+    if (runningChecks < MAX_CONCURRENT_CHECKS && checkQueue.length > 0) {
+      const next = checkQueue.shift();
+      if (next) next();
+    }
+  }
+}
+
+// Rotate the shared Chromium instance every six hours without restarting the bot.
+const chromiumRotationTimer = setInterval(() => {
+  rotateSharedChromium().catch(err => console.error('[browser] Rotation timer error:', err?.message || err));
+}, CHROMIUM_ROTATION_MS);
+if (typeof chromiumRotationTimer.unref === 'function') chromiumRotationTimer.unref();
+console.log('[browser] Automatic Chromium rotation enabled: every 6 hours.');
 
 async function runCheckWithBrowser(username, browser) {
   let page = null;
