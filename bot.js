@@ -103,25 +103,13 @@ function parseNum(str) {
   return str.replace(/,/g, '');
 }
 
-// ─── Puppeteer checker + hard watchdog + concurrency limiter ──────────────────
-// One Chromium process is shared between checks. Each account still gets a
-// completely fresh page, so cookies/page state are isolated while Chromium
-// process creation stays bounded to ONE instance.
-const MAX_CONCURRENT_CHECKS = 1;
-const CHECK_HARD_TIMEOUT = Math.max(30000, parseInt(process.env.PUPPETEER_HARD_TIMEOUT || '55000', 10));
+// ─── Shared Puppeteer browser + concurrency limiter ──────────────────────────
+// One Chromium instance for the whole bot. At most 2 pages/checks run at once.
+let sharedBrowser = null;
+let browserStarting = null;
+const MAX_CONCURRENT_CHECKS = 2;
 let runningChecks = 0;
 const checkQueue = [];
-let emptyMetaFailures = 0;
-const MAX_EMPTY_META_FAILURES = 2;
-// Instagram HTTP 429 cooldown: avoid immediate retries and repeated watch traffic.
-const IG_429_COOLDOWN_MS = Math.max(5 * 60 * 1000, parseInt(process.env.IG_429_COOLDOWN_MS || '900000', 10));
-let igRateLimitedUntil = 0;
-
-let sharedBrowser = null;
-let browserLaunchPromise = null;
-let browserRecyclePromise = null;
-let browserRotationInProgress = false;
-const CHROMIUM_ROTATION_MS = 6 * 60 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -130,9 +118,11 @@ function sleep(ms) {
 function getChromePath() {
   let chromePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
+  // Running inside pkg exe — find bundled/downloaded Chrome.
   if (!chromePath && typeof process.pkg !== 'undefined') {
     const exeDir = path.dirname(process.execPath);
     const cacheChromeDir = path.join(exeDir, '.cache', 'puppeteer', 'chrome');
+
     try {
       if (fs.existsSync(cacheChromeDir)) {
         const versions = fs.readdirSync(cacheChromeDir).sort().reverse();
@@ -153,6 +143,7 @@ function getChromePath() {
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
         path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe')
       ];
+
       for (const sp of systemPaths) {
         if (fs.existsSync(sp)) {
           chromePath = sp;
@@ -162,229 +153,128 @@ function getChromePath() {
       }
     }
   }
+
   return chromePath;
 }
 
+async function getBrowser() {
+  if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+  if (browserStarting) return browserStarting;
+
+  browserStarting = (async () => {
+    const puppeteer = require('puppeteer');
+    const chromePath = getChromePath();
+
+    console.log('[browser] Launching shared Chromium...');
+
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: chromePath,
+      // Instagram can keep a renderer/CDP call busy for longer than
+      // Puppeteer's default protocol timeout. Give Runtime.callFunctionOn
+      // enough time to finish instead of killing healthy checks too early.
+      protocolTimeout: 120000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--window-size=1280,800'
+      ]
+    });
+
+    sharedBrowser = browser;
+
+    browser.on('disconnected', () => {
+      if (sharedBrowser === browser) sharedBrowser = null;
+      console.warn('[browser] Chromium disconnected. It will relaunch on the next check.');
+    });
+
+    return browser;
+  })();
+
+  try {
+    return await browserStarting;
+  } finally {
+    browserStarting = null;
+  }
+}
+
 function acquireCheckSlot() {
-  if (!browserRotationInProgress && runningChecks < MAX_CONCURRENT_CHECKS) {
+  if (runningChecks < MAX_CONCURRENT_CHECKS) {
     runningChecks++;
     return Promise.resolve();
   }
-  return new Promise(resolve => checkQueue.push(resolve)).then(() => {
+
+  return new Promise(resolve => {
+    checkQueue.push(resolve);
+  }).then(() => {
     runningChecks++;
   });
 }
 
 function releaseCheckSlot() {
   runningChecks = Math.max(0, runningChecks - 1);
-  const next = browserRotationInProgress ? null : checkQueue.shift();
+  const next = checkQueue.shift();
   if (next) next();
 }
 
-async function safeClosePage(page) {
-  if (!page) return;
-  try {
-    await Promise.race([page.close(), sleep(1500)]);
-  } catch (_) {}
-}
-
-async function killBrowserProcess(browser) {
-  if (!browser) return;
-  try {
-    const proc = typeof browser.process === 'function' ? browser.process() : null;
-    if (proc && !proc.killed) proc.kill('SIGKILL');
-  } catch (_) {}
-}
-
-async function closeBrowserInstance(browser, reason = '') {
-  if (!browser) return;
-  if (reason) console.warn(`[browser] Recycling Chromium: ${reason}`);
-  try {
-    await Promise.race([browser.close(), sleep(1500)]);
-  } catch (_) {}
-  await killBrowserProcess(browser);
-}
-
-async function launchBrowser() {
-  const puppeteer = require('puppeteer');
-  const chromePath = getChromePath();
-  console.log('[browser] Launching shared Chromium...');
-
-  return puppeteer.launch({
-    headless: true,
-    executablePath: chromePath,
-    protocolTimeout: 60000,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--window-size=1280,800',
-      '--disable-background-networking',
-      '--disable-background-timer-throttling',
-      '--disable-renderer-backgrounding'
-    ]
-  });
-}
-
-async function getSharedBrowser() {
-  if (sharedBrowser) {
-    try {
-      if (sharedBrowser.connected) return sharedBrowser;
-    } catch (_) {}
-    sharedBrowser = null;
-  }
-
-  // Only ONE launch can be in progress. This prevents simultaneous Chromium
-  // spawns from hitting Railway's process limit and causing EAGAIN.
-  if (!browserLaunchPromise) {
-    browserLaunchPromise = (async () => {
-      try {
-        const browser = await launchBrowser();
-        sharedBrowser = browser;
-        browser.on('disconnected', () => {
-          if (sharedBrowser === browser) sharedBrowser = null;
-          console.warn('[browser] Chromium disconnected. A fresh instance will be launched when needed.');
-        });
-        return browser;
-      } finally {
-        browserLaunchPromise = null;
-      }
-    })();
-  }
-  return browserLaunchPromise;
-}
-
-async function recycleSharedBrowser(reason) {
-  if (browserRecyclePromise) return browserRecyclePromise;
-  browserRecyclePromise = (async () => {
-    const browser = sharedBrowser;
-    sharedBrowser = null;
-    if (browser) await closeBrowserInstance(browser, reason);
-  })().finally(() => {
-    browserRecyclePromise = null;
-  });
-  return browserRecyclePromise;
-}
-
-
-async function rotateSharedChromium(reason = 'scheduled 6-hour rotation') {
-  if (browserRotationInProgress) {
-    console.log('[browser] Rotation already in progress; skipping duplicate trigger.');
-    return;
-  }
-  browserRotationInProgress = true;
-  console.log(`[browser] Scheduled rotation requested; waiting for ${runningChecks} active check(s) to finish.`);
-  try {
-    // Do not close Chromium while a profile check is using its page.
-    while (runningChecks > 0) await sleep(1000);
-    await recycleSharedBrowser(reason);
-    console.log('[browser] Chromium rotation complete; a fresh instance will launch on the next check.');
-  } catch (err) {
-    console.error('[browser] Scheduled Chromium rotation failed:', err?.message || err);
-  } finally {
-    browserRotationInProgress = false;
-    // Resume queued checks only after the old browser has been closed.
-    if (runningChecks < MAX_CONCURRENT_CHECKS && checkQueue.length > 0) {
-      const next = checkQueue.shift();
-      if (next) next();
-    }
-  }
-}
-
-// Rotate the shared Chromium instance every six hours without restarting the bot.
-const chromiumRotationTimer = setInterval(() => {
-  rotateSharedChromium().catch(err => console.error('[browser] Rotation timer error:', err?.message || err));
-}, CHROMIUM_ROTATION_MS);
-if (typeof chromiumRotationTimer.unref === 'function') chromiumRotationTimer.unref();
-console.log('[browser] Automatic Chromium rotation enabled: every 6 hours.');
-
-async function runCheckWithBrowser(username, browser) {
+async function checkOnce(username) {
   let page = null;
+  let browser = null;
+  let slotAcquired = false;
+
   try {
-    // Reuse Chromium's existing page instead of creating a new CDP target for
-    // every Instagram check. Target.createTarget was timing out on Railway.
-    const pages = await browser.pages();
-    page = pages[0] || await browser.newPage();
-    try { await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (_) {}
-    page.setDefaultTimeout(20000);
-    page.setDefaultNavigationTimeout(35000);
+    await acquireCheckSlot();
+    slotAcquired = true;
+
+    console.log(`[check] ${username} starting (${runningChecks}/${MAX_CONCURRENT_CHECKS} slots used)`);
+
+    browser = await getBrowser();
+    page = await browser.newPage();
+
+    // Keep page operations bounded while allowing the CDP protocol itself
+    // more time (configured above) for slow Instagram renderer responses.
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(60000);
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 800 });
 
-    const navigationResponse = await page.goto(`https://www.instagram.com/${username}/`, {
+    await page.goto(`https://www.instagram.com/${username}/`, {
       waitUntil: 'domcontentloaded',
-      timeout: 35000
+      timeout: 60000
     });
 
-    await sleep(3000);
+    // Wait for meta tags to load.
+    await sleep(4000);
 
     const data = await page.evaluate(() => {
       const ogDesc = document.querySelector('meta[property="og:description"]');
       const ogImg  = document.querySelector('meta[property="og:image"]');
-      const title = document.title || '';
-      const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-      const url = location.href;
-      const htmlLength = document.documentElement?.outerHTML?.length || 0;
-      const lower = `${url} ${title} ${bodyText}`.toLowerCase();
       return {
         desc: ogDesc?.getAttribute('content') || '',
-        img: ogImg?.getAttribute('content') || '',
-        title,
-        url,
-        htmlLength,
-        bodyText: bodyText.slice(0, 2000),
-        signals: {
-          login: /\/accounts\/login|log in to instagram|login • instagram/.test(lower),
-          challenge: /challenge|checkpoint|confirm it.s you|security code|verify your identity/.test(lower),
-          rateLimit: /try again later|we restrict certain activity|please wait a few minutes|rate limit/.test(lower),
-          unavailable: /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(lower)
-        }
+        img:  ogImg?.getAttribute('content') || ''
       };
     });
 
     const raw = data.desc || '';
-    const responseStatus = navigationResponse ? navigationResponse.status() : 'no-main-response';
-    console.log(`[check] ${username} navigation: status=${responseStatus} url=${data.url} title=${JSON.stringify(data.title)} html=${data.htmlLength}`);
-    console.log(`[check] ${username} page signals: ${JSON.stringify(data.signals)}`);
     console.log(`[check] ${username} og:description:`, raw.substring(0, 100));
 
-    // HTTP 429 is authoritative even when Instagram's error page has no text.
-    if (Number(responseStatus) === 429) {
-      igRateLimitedUntil = Date.now() + IG_429_COOLDOWN_MS;
-      console.warn(`[check] ${username}: Instagram returned HTTP 429. Pausing all profile checks for ${Math.ceil(IG_429_COOLDOWN_MS / 60000)} minutes; account status remains UNKNOWN.`);
-      return null;
-    }
-
-    const pageText = `${data.title || ''} ${data.bodyText || ''}`.toLowerCase();
-    const clearlyUnavailable = data.signals?.unavailable || /sorry, this page isn't available|page isn't available|the link you followed may be broken|user not found|profile isn't available/.test(pageText);
-
-    if (!raw.trim() && !clearlyUnavailable) {
-      emptyMetaFailures++;
-      console.warn(`[check] ${username}: empty Instagram metadata (${emptyMetaFailures}/${MAX_EMPTY_META_FAILURES}); temporary failure. status=${responseStatus} url=${data.url} signals=${JSON.stringify(data.signals)}`);
-      if (emptyMetaFailures >= MAX_EMPTY_META_FAILURES) {
-        emptyMetaFailures = 0;
-        throw new Error('EMPTY_IG_METADATA_RECYCLE');
-      }
-      return null;
-    }
-
-    if (raw.trim()) emptyMetaFailures = 0;
-
-    const numPat = '([\\d,.]+[KMBkmb]?)';
-    const fMatch = raw.match(new RegExp(numPat + '\\s*Followers?', 'i'));
+    const numPat  = '([\\d,.]+[KMBkmb]?)';
+    const fMatch  = raw.match(new RegExp(numPat + '\\s*Followers?', 'i'));
     const foMatch = raw.match(new RegExp(numPat + '\\s*Following', 'i'));
-    const pMatch = raw.match(new RegExp(numPat + '\\s*Posts?', 'i'));
+    const pMatch  = raw.match(new RegExp(numPat + '\\s*Posts?', 'i'));
 
-    const followers = fMatch ? parseNum(fMatch[1]) : null;
+    const followers = fMatch  ? parseNum(fMatch[1])  : null;
     const following = foMatch ? parseNum(foMatch[1]) : null;
-    const posts = pMatch ? parseNum(pMatch[1]) : null;
+    const posts     = pMatch  ? parseNum(pMatch[1])  : null;
 
     console.log(`[check] ${username} parsed: followers=${followers}, following=${following}`);
 
+    // Fetch real profile pic using the same page/browser session.
     let profilePic = null;
     if (data.img) {
       try {
@@ -399,14 +289,17 @@ async function runCheckWithBrowser(username, browser) {
                 let binary = '';
                 for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
                 resolve(btoa(binary));
-              } else resolve(null);
+              } else {
+                resolve(null);
+              }
             };
             xhr.onerror = () => resolve(null);
-            xhr.timeout = 6000;
+            xhr.timeout = 8000;
             xhr.ontimeout = () => resolve(null);
             xhr.send();
           });
         }, data.img);
+
         if (b64) {
           profilePic = Buffer.from(b64, 'base64');
           console.log(`[check] ${username} profile pic fetched via XHR (${profilePic.length} bytes)`);
@@ -416,93 +309,39 @@ async function runCheckWithBrowser(username, browser) {
       }
     }
 
-    const banned = clearlyUnavailable || (!followers && !following && !!raw.trim());
+    const banned = !followers && !following;
     return { banned, followers, following, posts, profilePic, bio: '', isVerified: false };
-  } finally {
-    // Keep the page alive for reuse. Closing it here forces another
-    // Target.createTarget on the next check.
-  }
-}
 
-async function checkOnce(username) {
-  if (Date.now() < igRateLimitedUntil) {
-    const secondsLeft = Math.ceil((igRateLimitedUntil - Date.now()) / 1000);
-    console.warn(`[check] ${username}: Instagram 429 cooldown active; skipping request (${secondsLeft}s left).`);
-    return null;
-  }
-  let slotAcquired = false;
-  let timedOut = false;
-  let browser = null;
-
-  try {
-    await acquireCheckSlot();
-    slotAcquired = true;
-    console.log(`[check] ${username} starting (${runningChecks}/${MAX_CONCURRENT_CHECKS} slots used)`);
-
-    browser = await getSharedBrowser();
-
-    let operation;
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(async () => {
-        timedOut = true;
-        await recycleSharedBrowser(`${username} exceeded ${CHECK_HARD_TIMEOUT}ms hard timeout`);
-        reject(new Error('PUPPETEER_HARD_TIMEOUT'));
-      }, CHECK_HARD_TIMEOUT);
-    });
-
-    operation = runCheckWithBrowser(username, browser);
-    operation.catch(() => {});
-
-    try {
-      const result = await Promise.race([operation, timeout]);
-      clearTimeout(timer);
-      return result;
-    } catch (err) {
-      clearTimeout(timer);
-      throw err;
-    }
   } catch (err) {
     console.error(`[check] Puppeteer error for ${username}:`, err.message);
-    if (timedOut) console.warn(`[check] ${username}: hard watchdog recycled the shared Chromium.`);
-
-    // EAGAIN means the OS refused a new Chromium process. With the shared
-    // browser design this should be rare; recycle the stale instance once.
-    if (/EAGAIN|Failed to launch the browser process|Target\.createTarget timed out|Target\.createTarget/i.test(err.message || '')) {
-      await recycleSharedBrowser(`${username} Chromium target/browser failure`);
-      // Give Railway's process table a moment to settle before another launch.
-      await sleep(3000);
-    }
     return null;
   } finally {
-    if (slotAcquired) {
-      releaseCheckSlot();
-      console.log(`[check] ${username} slot released (${runningChecks}/${MAX_CONCURRENT_CHECKS} slots used)`);
-    }
+    // Close ONLY the page, never the shared Chromium instance.
+    if (page) await page.close().catch(() => {});
+    if (slotAcquired) releaseCheckSlot();
   }
 }
 
+async function closeSharedBrowser() {
+  // Don't kill a browser while checks are still running.
+  while (runningChecks > 0) await sleep(100);
+
+  if (sharedBrowser) {
+    const browser = sharedBrowser;
+    sharedBrowser = null;
+    await browser.close().catch(() => {});
+    console.log('[browser] Shared Chromium closed.');
+  }
+}
+
+// Retry wrapper
 async function check(username, retries = 2) {
   for (let i = 0; i < retries; i++) {
     const result = await checkOnce(username);
     if (result !== null) return result;
-    if (Date.now() < igRateLimitedUntil) {
-      console.warn(`[check] ${username}: stopping retries because Instagram 429 cooldown is active; returning UNKNOWN/null.`);
-      return null;
-    }
-    if (i < retries - 1) {
-      console.log(`[check] ${username} retry ${i + 2}/${retries} in 5s...`);
-      await sleep(5000);
-    }
+    if (i < retries - 1) await new Promise(r => setTimeout(r, 3000));
   }
-  console.warn(`[check] ${username}: all attempts failed; returning UNKNOWN/null.`);
   return null;
-}
-
-async function closeSharedBrowser() {
-  const browser = sharedBrowser;
-  sharedBrowser = null;
-  if (browser) await closeBrowserInstance(browser, 'shutdown');
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -590,8 +429,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
   try {
     const { createCanvas, loadImage, GlobalFonts } = require('@napi-rs/canvas');
 
-    const W = 900, PAD = 30;
-    const AVATAR_SIZE = 120;
+    const W = 800, PAD = 28;
+    const AVATAR_SIZE = 100;
     const BIO_MAX_W   = 500;
 
     // Measure bio lines
@@ -614,8 +453,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
       if (line) bioLines.push(line);
     }
 
-    const H = PAD + AVATAR_SIZE + PAD + (bioLines.length > 0 ? bioLines.length * 20 + 12 : 0);
-    const canvas = createCanvas(W, Math.max(H, 230));
+    const H = PAD + AVATAR_SIZE + PAD + (bioLines.length > 0 ? bioLines.length * 18 + 10 : 0);
+    const canvas = createCanvas(W, Math.max(H, 170));
     const ctx    = canvas.getContext('2d');
 
     // Background
@@ -688,11 +527,11 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
 
     // Right side start
     const rx = avatarX + AVATAR_SIZE + 20;
-    let   ry = PAD + 8;
+    let   ry = PAD + 6;
 
     // Username
     ctx.fillStyle = '#ffffff';
-    ctx.font      = '600 22px sans-serif';
+    ctx.font      = '500 18px sans-serif';
     ctx.fillText(username, rx, ry + 14);
 
     // Inline verified badge next to username
@@ -723,8 +562,8 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
     ctx.roundRect(btnX, btnY, 80, 28, 8);
     ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.font      = 'bold 14px sans-serif';
-    ctx.fillText('Follow', btnX + 17, btnY + 19);
+    ctx.font      = 'bold 13px sans-serif';
+    ctx.fillText('Follow', btnX + 16, btnY + 18);
 
     // More button
     ctx.fillStyle = '#2e2e2e';
@@ -732,39 +571,37 @@ async function takeScreenshot(username, followers, following, profilePicUrl, pos
     ctx.roundRect(btnX + 88, btnY, 36, 28, 8);
     ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.font      = 'bold 16px sans-serif';
-    ctx.fillText('···', btnX + 97, btnY + 19);
+    ctx.font      = 'bold 15px sans-serif';
+    ctx.fillText('···', btnX + 96, btnY + 18);
 
     ry += 42;
 
-    // Stats: bright white numbers AND labels, positioned like the original card.
+    // Stats — number bold on top, label small below (no overlap)
     const stats = [
       { num: fmtNum(posts),     label: 'posts' },
       { num: fmtNum(followers), label: 'followers' },
       { num: fmtNum(following), label: 'following' }
     ];
-    const statColW = 142;
+    const statColW = 110;
     let sx = rx;
     for (const s of stats) {
-      ctx.save();
-      ctx.globalAlpha = 1;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'alphabetic';
+      // Bold number
       ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 28px Arial, sans-serif';
-      ctx.fillText(String(s.num ?? '—'), sx, ry);
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 16px Arial, sans-serif';
-      ctx.fillText(s.label, sx, ry + 22);
-      ctx.restore();
+      ctx.font      = 'bold 16px sans-serif';
+      ctx.fillText(s.num, sx, ry);
+      // Small grey label below
+      ctx.fillStyle = '#aaaaaa';
+      ctx.font      = '12px sans-serif';
+      ctx.fillText(s.label, sx, ry + 16);
       sx += statColW;
     }
+
     ry += 34;
 
     // Bio
     if (bioLines.length > 0) {
       ctx.fillStyle = '#e0e0e0';
-      ctx.font      = '14px sans-serif';
+      ctx.font      = '13px sans-serif';
       for (const line of bioLines) {
         ctx.fillText(line, rx, ry);
         ry += 18;
