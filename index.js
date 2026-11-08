@@ -1,23 +1,50 @@
-// ─── EXE-safe base directory ──────────────────────────────────────────────────
-// When running as pkg exe: process.execPath = path to exe, process.pkg is defined
-// When running as node: process.argv[1] = path to script
-const path = require('path');
 
-// Detect if running inside pkg exe
+// ─── EXE-safe base directory ──────────────────────────────────────────────────
+const path = require('path');
+const http = require('http');
+
+// Detect if running inside pkg EXE
 const isPkg = typeof process.pkg !== 'undefined';
 
-// Base directory = folder where the exe (or script) lives
+// Base directory = folder where EXE or script lives
 const BASE_DIR = isPkg
-  ? path.dirname(process.execPath)    // exe folder
-  : path.dirname(process.argv[1]);    // script folder (same as __dirname for index.js)
+  ? path.dirname(process.execPath)
+  : path.dirname(process.argv[1] || __filename);
 
-// Make it globally available for bot.js and db.js
+// Make globally available for bot.js and db.js
 global.__basedir = BASE_DIR;
 
-// Load .env from the exe/script directory
-require('dotenv').config({ path: path.join(BASE_DIR, '.env') });
+// Load .env from EXE/script directory
+require('dotenv').config({
+  path: path.join(BASE_DIR, '.env')
+});
 
-const db  = require('./db');
+// ─── HTTP Health Server (Render Web Service) ──────────────────────────────────
+const PORT = Number(process.env.PORT) || 3000;
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json'
+    });
+
+    return res.end(JSON.stringify({
+      status: 'online',
+      service: 'Instagram Monitor Discord Bot',
+      timestamp: new Date().toISOString()
+    }));
+  }
+
+  res.writeHead(404);
+  res.end('Not Found');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[HTTP] Health server listening on port ${PORT}`);
+});
+
+// ─── Database and Discord Bot ─────────────────────────────────────────────────
+const db = require('./db');
 const bot = require('./bot');
 
 async function start() {
@@ -33,7 +60,27 @@ async function start() {
   await bot.start();
 }
 
+// ─── Startup Error Handling ───────────────────────────────────────────────────
 start().catch(err => {
   console.error('❌ Startup failed:', err);
-  process.exit(1);
+
+  server.close(() => {
+    process.exit(1);
+  });
+
+  // Prevent hanging if server close does not complete
+  setTimeout(() => process.exit(1), 5000).unref();
 });
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+function shutdown(signal) {
+  console.log(`[SHUTDOWN] Received ${signal}`);
+
+  server.close(() => {
+    console.log('[HTTP] Health server closed');
+    process.exit(0);
+  });
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
